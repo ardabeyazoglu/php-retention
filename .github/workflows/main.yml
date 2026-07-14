@@ -8,23 +8,20 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v2
 
-      - name: Install composer and dependencies
-        uses: php-actions/composer@v6
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: xdebug
+          coverage: xdebug
 
-      - name: Fix vendor permissions
-        run: sudo chmod -R a+rwX vendor
+      - name: Install composer dependencies
+        run: composer install --no-interaction --prefer-dist
 
       - name: PHPUnit Tests
-        uses: php-actions/phpunit@v3
         env:
           XDEBUG_MODE: coverage
-        with:
-          bootstrap: vendor/autoload.php
-          configuration: phpunit.xml
-          php_version: 8.3
-          php_extensions: xdebug
-          vendored_phpunit_path: vendor/bin/phpunit
-          args: tests --coverage-clover ./coverage.xml
+        run: vendor/bin/phpunit --bootstrap vendor/autoload.php --configuration phpunit.xml tests --coverage-clover ./coverage.xml
 
       - name: Upload coverage reports to Codecov
         uses: codecov/codecov-action@v3
