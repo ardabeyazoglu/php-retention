@@ -1,28 +1,63 @@
 name: tests
-run-name: run tests and create code coverage
+run-name: Run tests
+
 on: [push]
+
 jobs:
-  test-php83:
+  tests:
+    name: PHP ${{ matrix.php }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - php: "8.3"
+            coverage: true
+          - php: "8.4"
+            coverage: false
+          - php: "8.5"
+            coverage: false
+
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v2
-
-      - name: Install composer and dependencies
-        uses: php-actions/composer@v6
-
-      - name: PHPUnit Tests
-        uses: php-actions/phpunit@v3
-        env:
-          XDEBUG_MODE: coverage
+      - name: Checkout code
+        uses: actions/checkout@v6
         with:
-          bootstrap: vendor/autoload.php
-          configuration: phpunit.xml
-          php_version: 8.3
-          php_extensions: xdebug
-          args: tests --coverage-clover ./coverage.xml
+          fetch-depth: 1
 
-      - name: Upload coverage reports to Codecov
-        uses: codecov/codecov-action@v3
-        env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          coverage: ${{ matrix.coverage && 'xdebug' || 'none' }}
+          tools: composer:v2
+
+      - name: Get Composer cache directory
+        id: composer-cache
+        run: echo "dir=$(composer config cache-files-dir)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Composer packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: ${{ runner.os }}-php-${{ matrix.php }}-composer-${{ hashFiles('composer.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-php-${{ matrix.php }}-composer-
+            ${{ runner.os }}-php-
+
+      - name: Install dependencies
+        run: composer install --prefer-dist --no-interaction --no-progress
+
+      - name: Run tests
+        if: ${{ !matrix.coverage }}
+        run: composer test
+
+      - name: Run tests with coverage
+        if: ${{ matrix.coverage }}
+        run: composer test -- --coverage-clover coverage.xml
+
+      - name: Upload coverage to Codecov
+        if: ${{ matrix.coverage }}
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage.xml

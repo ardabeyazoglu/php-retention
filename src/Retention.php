@@ -159,7 +159,7 @@ class Retention implements LoggerAwareInterface
     /**
      * apply retention policy under specified root directory.
      * @param string $baseDir
-     * @return array
+     * @return Result
      */
     public function apply(string $baseDir): Result
     {

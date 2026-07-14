@@ -22,12 +22,12 @@ class TestCase extends PHPUnitTestCase
      */
     protected static string $tmpDir;
 
-    public function __construct(?string $name = null)
+    protected function setUp(): void
     {
-        parent::__construct($name);
+        parent::setUp();
 
         $className = explode('\\', get_class($this));
-        self::$tmpDir = sys_get_temp_dir() . '/' . array_pop($className) . '_' . bin2hex(random_bytes(8));
+        self::$tmpDir = sys_get_temp_dir() . '/' . array_pop($className) . '_' . bin2hex(\random_bytes(8));
 
         date_default_timezone_set("UTC");
     }
