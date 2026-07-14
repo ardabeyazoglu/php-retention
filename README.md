@@ -13,8 +13,8 @@ A typical example would be backup archiving based on custom policies such as "ke
 - Customize file finder logic (e.g. support different storage interfaces such as S3)
 - Grouping files (e.g. prune multiple files together instead of a single file)
 - Dry runnable
-- Logger aware
-- No dependencies
+- Logger aware (PSR-3)
+- No dependencies other than the PSR-3 logger interface (`psr/log`)
 
 # Install
 
