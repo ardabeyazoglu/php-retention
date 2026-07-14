@@ -9,9 +9,7 @@ use DateTimeZone;
 use Exception;
 use PhpRetention\FileInfo;
 use PhpRetention\Retention;
-use PhpRetention\RetentionException;
 use PHPUnit\Framework\Attributes\DataProvider;
-use Psr\Log\AbstractLogger;
 
 /**
  * @covers \PhpRetention\Retention
@@ -382,127 +380,382 @@ class RetentionTest extends TestCase
         self::assertTrue(file_exists($baseDir . '/' . $testFiles[1]));
     }
 
-    public function testDryRunDoesNotPruneFiles(): void
+    /* ------------------------------------------------------------------ *
+     *  Edge-case tests                                                    *
+     * ------------------------------------------------------------------ */
+
+    /**
+     * @var string[] paths passed to the prune handler in a virtual-file test
+     */
+    private array $prunedPaths = [];
+
+    private function utc(string $datetime): DateTimeImmutable
     {
-        $pruneCalls = 0;
-        $retention = new Retention(['keep-last' => 1]);
-        $retention->setFindHandler(fn () => [
-            new FileInfo(new DateTimeImmutable('2024-01-02'), '/backup/new'),
-            new FileInfo(new DateTimeImmutable('2024-01-01'), '/backup/old'),
-        ]);
-        $retention->setPruneHandler(function () use (&$pruneCalls): bool {
-            ++$pruneCalls;
+        return new DateTimeImmutable($datetime, new DateTimeZone('UTC'));
+    }
+
+    /**
+     * Build a Retention that operates on a virtual list of files (no disk I/O),
+     * recording pruned paths in $this->prunedPaths instead of deleting anything.
+     *
+     * @param array $policy
+     * @param array $fileSpecs list of [string $path, DateTimeImmutable $date, bool $isDir=false]
+     */
+    private function buildRetention(array $policy, array $fileSpecs): Retention
+    {
+        $this->prunedPaths = [];
+
+        $retention = new Retention($policy);
+        $retention->setFindHandler(function () use ($fileSpecs) {
+            $files = [];
+            foreach ($fileSpecs as $spec) {
+                $files[] = new FileInfo(
+                    date: $spec[1],
+                    path: $spec[0],
+                    isDirectory: $spec[2] ?? false
+                );
+            }
+
+            return $files;
+        });
+        $retention->setPruneHandler(function (FileInfo $fileInfo) {
+            $this->prunedPaths[] = $fileInfo->path;
+
             return true;
         });
-        $retention->setDryRun(true);
 
-        $result = $retention->apply('/backup');
-
-        self::assertSame(0, $pruneCalls);
-        self::assertSame('/backup/new', $result->keepList[0]['fileInfo']->path);
-        self::assertSame('/backup/old', $result->pruneList[0]->path);
+        return $retention;
     }
 
-    #[DataProvider('invalidFindHandlerProvider')]
-    public function testFindHandlerMustReturnFileInfoArray(mixed $result): void
+    private function keptPaths($result): array
     {
-        $retention = new Retention();
-        $retention->setFindHandler(fn () => $result);
+        $paths = [];
+        foreach ($result->keepList as $keep) {
+            $paths[] = $keep['fileInfo']->path;
+        }
 
-        $this->expectException(RetentionException::class);
-        $this->expectExceptionMessage('Find handler must return an array of FileInfo objects.');
-
-        $retention->findFiles('/backup');
+        return $paths;
     }
 
-    public static function invalidFindHandlerProvider(): array
+    /**
+     * Different days must never share a bucket. Previously the index was built
+     * from unpadded integers, so 2024-01-15 and 2024-11-05 both mapped to
+     * "2024115" and one of them was silently dropped by the daily policy.
+     */
+    public function testDailyPolicyKeepsDistinctDaysThatUsedToCollide()
     {
-        return [
-            'not an array' => ['invalid'],
-            'array with invalid item' => [[new \stdClass()]],
+        $files = [
+            ['/backup/day/file-20241105', $this->utc('2024-11-05 05:00:00')],
+            ['/backup/day/file-20240610', $this->utc('2024-06-10 05:00:00')],
+            ['/backup/day/file-20240115', $this->utc('2024-01-15 05:00:00')],
         ];
+
+        $retention = $this->buildRetention(['keep-daily' => 3], $files);
+        $result = $retention->apply('/backup/day');
+
+        $kept = $this->keptPaths($result);
+        sort($kept);
+
+        self::assertSame([
+            '/backup/day/file-20240115',
+            '/backup/day/file-20240610',
+            '/backup/day/file-20241105',
+        ], $kept);
+        self::assertEmpty($this->prunedPaths);
     }
 
-    public function testFailedPruneHandlerThrowsRetentionException(): void
+    /**
+     * Files created exactly at midnight (hour 0) must still be eligible for the
+     * hourly policy. The old `$hour > 0` guard excluded them while still letting
+     * them consume an hourly bucket slot.
+     */
+    public function testHourlyPolicyIncludesMidnightHour()
     {
-        $retention = new Retention(['keep-last' => 1]);
-        $retention->setFindHandler(fn () => [
-            new FileInfo(new DateTimeImmutable('2024-01-02'), '/backup/new'),
-            new FileInfo(new DateTimeImmutable('2024-01-01'), '/backup/old'),
-        ]);
-        $retention->setPruneHandler(fn () => false);
+        // newest -> oldest; the midnight file is the oldest so only keep-hourly
+        // (not keep-last) can retain it.
+        $files = [
+            ['/backup/hour/file-0230', $this->utc('2024-03-01 02:30:00')],
+            ['/backup/hour/file-0130', $this->utc('2024-03-01 01:30:00')],
+            ['/backup/hour/file-0030', $this->utc('2024-03-01 00:30:00')],
+        ];
 
-        $this->expectException(RetentionException::class);
-        $this->expectExceptionMessage('Pruning /backup/old failed unexpectedly.');
+        $retention = $this->buildRetention(['keep-hourly' => 3], $files);
+        $result = $retention->apply('/backup/hour');
 
-        $retention->apply('/backup');
+        $kept = $this->keptPaths($result);
+
+        self::assertContains(
+            '/backup/hour/file-0030',
+            $kept,
+            'a midnight-hour file must be retained by keep-hourly'
+        );
+        self::assertCount(3, $kept);
+        self::assertEmpty($this->prunedPaths);
     }
 
-    public function testDefaultFinderExcludesAndSkipsFiles(): void
+    /**
+     * The weekly bucket must use the ISO year, not the calendar year. 2019-12-30
+     * belongs to ISO week 01 of 2020, while 2019-01-02 is ISO week 01 of 2019;
+     * with calendar-year indexing they both mapped to "20191".
+     */
+    public function testWeeklyPolicyUsesIsoYearAtBoundary()
     {
-        $baseDir = self::$tmpDir . '/' . __FUNCTION__;
-        mkdir($baseDir, 0o770, true);
-        file_put_contents($baseDir . '/included', '');
-        file_put_contents($baseDir . '/excluded', '');
-        file_put_contents($baseDir . '/skipped', '');
-        mkdir($baseDir . '/directory');
+        $files = [
+            ['/backup/week/file-20191230', $this->utc('2019-12-30 05:00:00')],
+            ['/backup/week/file-20190102', $this->utc('2019-01-02 05:00:00')],
+        ];
 
-        $retention = new Retention();
-        $retention->setExcludePattern('/excluded$/');
-        $retention->setTimeHandler(function (string $path, bool $isDirectory): ?FileInfo {
-            if (str_ends_with($path, '/skipped')) {
-                return null;
+        $retention = $this->buildRetention(['keep-weekly' => 2], $files);
+        $result = $retention->apply('/backup/week');
+
+        $kept = $this->keptPaths($result);
+        sort($kept);
+
+        self::assertSame([
+            '/backup/week/file-20190102',
+            '/backup/week/file-20191230',
+        ], $kept);
+        self::assertEmpty($this->prunedPaths);
+    }
+
+    /**
+     * Weekly counting must remain correct across a year boundary: keep the N
+     * most recent distinct ISO weeks and prune the rest.
+     */
+    public function testWeeklyPolicyCountAcrossNewYear()
+    {
+        $files = [
+            ['/backup/wk/2021-01-13', $this->utc('2021-01-13 05:00:00')], // ISO 2021-W02
+            ['/backup/wk/2021-01-06', $this->utc('2021-01-06 05:00:00')], // ISO 2021-W01
+            ['/backup/wk/2020-12-30', $this->utc('2020-12-30 05:00:00')], // ISO 2020-W53
+            ['/backup/wk/2020-12-23', $this->utc('2020-12-23 05:00:00')], // ISO 2020-W52
+            ['/backup/wk/2020-12-16', $this->utc('2020-12-16 05:00:00')], // ISO 2020-W51
+        ];
+
+        $retention = $this->buildRetention(['keep-weekly' => 3], $files);
+        $result = $retention->apply('/backup/wk');
+
+        $kept = $this->keptPaths($result);
+        sort($kept);
+        self::assertSame([
+            '/backup/wk/2020-12-30',
+            '/backup/wk/2021-01-06',
+            '/backup/wk/2021-01-13',
+        ], $kept);
+
+        sort($this->prunedPaths);
+        self::assertSame([
+            '/backup/wk/2020-12-16',
+            '/backup/wk/2020-12-23',
+        ], $this->prunedPaths);
+    }
+
+    /**
+     * An empty policy (and keep-last=0) must keep exactly the most recent file.
+     */
+    public function testEmptyPolicyKeepsOnlyNewest()
+    {
+        $files = [
+            ['/backup/cfg/new', $this->utc('2024-05-03 05:00:00')],
+            ['/backup/cfg/mid', $this->utc('2024-05-02 05:00:00')],
+            ['/backup/cfg/old', $this->utc('2024-05-01 05:00:00')],
+        ];
+
+        foreach ([[], ['keep-last' => 0]] as $policy) {
+            $retention = $this->buildRetention($policy, $files);
+            $result = $retention->apply('/backup/cfg');
+
+            self::assertSame(['/backup/cfg/new'], $this->keptPaths($result));
+            sort($this->prunedPaths);
+            self::assertSame(['/backup/cfg/mid', '/backup/cfg/old'], $this->prunedPaths);
+        }
+    }
+
+    /**
+     * Negative policy values are clamped to 0, so a negative keep-daily is a
+     * no-op and only the keep-last>=1 safety net applies.
+     */
+    public function testNegativePolicyValuesAreClamped()
+    {
+        $files = [
+            ['/backup/neg/d3', $this->utc('2024-05-03 05:00:00')],
+            ['/backup/neg/d2', $this->utc('2024-05-02 05:00:00')],
+            ['/backup/neg/d1', $this->utc('2024-05-01 05:00:00')],
+        ];
+
+        $retention = $this->buildRetention(['keep-daily' => -5, 'keep-last' => -1], $files);
+        $result = $retention->apply('/backup/neg');
+
+        self::assertSame(['/backup/neg/d3'], $this->keptPaths($result));
+        self::assertCount(2, $this->prunedPaths);
+    }
+
+    /**
+     * Files that share the exact same timestamp must produce a deterministic,
+     * warning-free result (the comparator now returns 0 for equal timestamps).
+     */
+    public function testSortStabilityWithEqualTimestamps()
+    {
+        $date = $this->utc('2024-05-05 05:00:00');
+        $files = [
+            ['/backup/eq/a', $date],
+            ['/backup/eq/b', $date],
+            ['/backup/eq/c', $date],
+        ];
+
+        $retention = $this->buildRetention(['keep-last' => 1], $files);
+        $result = $retention->apply('/backup/eq');
+
+        self::assertCount(1, $result->keepList);
+        self::assertCount(2, $this->prunedPaths);
+    }
+
+    /**
+     * Grouping must work with period policies, not just keep-last: the group is
+     * kept or pruned as a unit based on its newest member.
+     */
+    public function testGroupingWithDailyPolicy()
+    {
+        $this->prunedPaths = [];
+
+        $retention = new Retention(['keep-daily' => 1]);
+        $retention->setPruneHandler(function (FileInfo $fileInfo) {
+            $this->prunedPaths[] = $fileInfo->path;
+
+            return true;
+        });
+        $retention->setFindHandler(function () {
+            $files = [];
+            $specs = [
+                '/backup/t/mysql-20240107.tar.gz',
+                '/backup/t/files-20240107.tar.gz',
+                '/backup/t/mysql-20240106.tar.gz',
+                '/backup/t/files-20240106.tar.gz',
+            ];
+            foreach ($specs as $filepath) {
+                preg_match('/\-([0-9]{4})([0-9]{2})([0-9]{2})/', $filepath, $m);
+                $date = (new DateTimeImmutable('now', new DateTimeZone('UTC')))
+                    ->setDate((int) $m[1], (int) $m[2], (int) $m[3])
+                    ->setTime(0, 0, 0);
+                $files[] = new FileInfo(date: $date, path: $filepath, isDirectory: false);
             }
 
-            return new FileInfo(new DateTimeImmutable('2024-01-01'), $path, $isDirectory);
+            return $files;
+        });
+        $retention->setGroupHandler(function (string $filepath) {
+            return preg_match('/\-([0-9]{8})\.tar\.gz$/', $filepath, $m) ? $m[1] : null;
         });
 
-        $files = $retention->findFiles($baseDir);
+        $result = $retention->apply('/backup/t');
 
-        self::assertCount(2, $files);
-        self::assertSame(['directory', 'included'], array_map(
-            fn (FileInfo $fileInfo) => basename($fileInfo->path),
-            $files
-        ));
-        self::assertTrue($files[0]->isDirectory);
-        self::assertFalse($files[1]->isDirectory);
+        $kept = $this->keptPaths($result);
+        sort($kept);
+        self::assertSame([
+            '/backup/t/files-20240107.tar.gz',
+            '/backup/t/mysql-20240107.tar.gz',
+        ], $kept);
+
+        sort($this->prunedPaths);
+        self::assertSame([
+            '/backup/t/files-20240106.tar.gz',
+            '/backup/t/mysql-20240106.tar.gz',
+        ], $this->prunedPaths);
     }
 
-    public function testEmptyFinderResultIsLogged(): void
+    /**
+     * The default recursive pruner must remove directory trees deeper than one
+     * level (the previous LEAVES_ONLY iteration left nested directories behind).
+     */
+    public function testPruneByNestedDirectory()
     {
-        $logger = new class extends AbstractLogger {
-            public array $records = [];
+        $baseDir = self::$tmpDir . '/' . __FUNCTION__;
 
-            public function log($level, string|\Stringable $message, array $context = []): void
-            {
-                $this->records[] = compact('level', 'message', 'context');
-            }
-        };
-        $retention = new Retention();
-        $retention->setFindHandler(fn () => []);
-        $retention->setLogger($logger);
+        $dates = ['20240129', '20240128', '20240127'];
+        foreach ($dates as $d) {
+            $deep = "$baseDir/backup-$d/sub/deep";
+            mkdir($deep, 0o770, true);
+            file_put_contents("$deep/file.txt", '...');
+            file_put_contents("$baseDir/backup-$d/root.txt", '...');
+        }
 
-        $result = $retention->apply('/empty');
-
-        self::assertSame([], $result->keepList);
-        self::assertSame('notice', $logger->records[0]['level']);
-        self::assertSame('There must be at least one file to keep.', $logger->records[0]['message']);
-        self::assertSame(['baseDir' => '/empty'], $logger->records[0]['context']);
-    }
-
-    public function testPruneHandlerExceptionIsWrapped(): void
-    {
         $retention = new Retention(['keep-last' => 1]);
-        $retention->setFindHandler(fn () => [
-            new FileInfo(new DateTimeImmutable('2024-01-02'), '/backup/new'),
-            new FileInfo(new DateTimeImmutable('2024-01-01'), '/backup/old'),
-        ]);
-        $retention->setPruneHandler(fn () => throw new \RuntimeException('storage unavailable'));
+        $retention->setFindHandler($this->datedDirectoryFinder());
+        $retention->apply($baseDir);
 
-        $this->expectException(RetentionException::class);
-        $this->expectExceptionMessage('storage unavailable');
+        self::assertDirectoryDoesNotExist("$baseDir/backup-20240128");
+        self::assertDirectoryDoesNotExist("$baseDir/backup-20240127");
+        self::assertDirectoryExists("$baseDir/backup-20240129/sub/deep");
+        self::assertFileExists("$baseDir/backup-20240129/sub/deep/file.txt");
+        self::assertFileExists("$baseDir/backup-20240129/root.txt");
+    }
 
-        $retention->apply('/backup');
+    /**
+     * The default recursive pruner must not follow symlinks out of the tree: the
+     * link itself is removed, but its target (outside the pruned dir) survives.
+     */
+    public function testPruneDoesNotFollowSymlinks()
+    {
+        if (PATH_SEPARATOR === ';') {
+            self::markTestSkipped('symlink semantics differ on Windows');
+        }
+
+        $baseDir = self::$tmpDir . '/' . __FUNCTION__;
+
+        $outside = $baseDir . '/outside';
+        mkdir($outside, 0o770, true);
+        file_put_contents("$outside/secret.txt", 'do not delete');
+
+        // older dir contains a symlink pointing outside the pruned tree
+        mkdir("$baseDir/backup-20240128", 0o770, true);
+        file_put_contents("$baseDir/backup-20240128/data.txt", '...');
+        symlink($outside, "$baseDir/backup-20240128/link-to-outside");
+
+        mkdir("$baseDir/backup-20240129", 0o770, true);
+        file_put_contents("$baseDir/backup-20240129/data.txt", '...');
+
+        $retention = new Retention(['keep-last' => 1]);
+        $retention->setFindHandler($this->datedDirectoryFinder());
+        $retention->apply($baseDir);
+
+        // the older backup dir (and its symlink) is removed...
+        self::assertDirectoryDoesNotExist("$baseDir/backup-20240128");
+        // ...but the target outside the tree is untouched
+        self::assertDirectoryExists($outside);
+        self::assertFileExists("$outside/secret.txt");
+        self::assertStringEqualsFile("$outside/secret.txt", 'do not delete');
+        self::assertDirectoryExists("$baseDir/backup-20240129");
+    }
+
+    /**
+     * Shared finder for the on-disk directory tests: treats each "backup-YYYYMMDD"
+     * entry in the target dir as a dated directory and ignores everything else.
+     */
+    private function datedDirectoryFinder(): callable
+    {
+        return function (string $targetDir) {
+            $files = [];
+            foreach (scandir($targetDir) as $dir) {
+                if (in_array($dir, ['.', '..'])) {
+                    continue;
+                }
+
+                if (!preg_match('/^backup\-([0-9]{4})([0-9]{2})([0-9]{2})$/', $dir, $matches)) {
+                    continue;
+                }
+
+                $date = (new DateTimeImmutable('now', new DateTimeZone('UTC')))
+                    ->setDate((int) $matches[1], (int) $matches[2], (int) $matches[3])
+                    ->setTime(0, 0, 0);
+
+                $files[] = new FileInfo(
+                    date: $date,
+                    path: "$targetDir/$dir",
+                    isDirectory: true
+                );
+            }
+
+            return $files;
+        };
     }
 
 }

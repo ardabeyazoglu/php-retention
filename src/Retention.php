@@ -6,6 +6,7 @@ namespace PhpRetention;
 
 use DateTimeImmutable;
 use DateTimeZone;
+use FilesystemIterator;
 use Psr\Log\LoggerAwareInterface;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
@@ -254,17 +255,12 @@ class Retention implements LoggerAwareInterface
             $fileInfo = $fileInfos[0];
             /** @var FileInfo $fileInfo */
 
-            $hour = $fileInfo->hour;
-            $day = $fileInfo->day;
-            $week = $fileInfo->week;
-            $month = $fileInfo->month;
-            $year = $fileInfo->year;
-
-            $hourIndex = $year . $month . $day . $hour;
-            $dayIndex = $year . $month . $day;
-            $weekIndex = $year . $week;
-            $monthIndex = $year . $month;
-            $yearIndex = $year;
+            // fixed-width, collision-safe bucket keys (computed once in FileInfo)
+            $hourIndex = $fileInfo->hourIndex;
+            $dayIndex = $fileInfo->dayIndex;
+            $weekIndex = $fileInfo->weekIndex;
+            $monthIndex = $fileInfo->monthIndex;
+            $yearIndex = $fileInfo->yearIndex;
 
             $keep = false;
             $reasons = [];
@@ -278,7 +274,7 @@ class Retention implements LoggerAwareInterface
                 }
             }
 
-            if ($this->keepHourly && $hour > 0) {
+            if ($this->keepHourly) {
                 $keepCount = count($hourlyList);
                 if ($this->keepHourly > $keepCount) {
                     if (!isset($hourlyList[$hourIndex])) {
@@ -288,7 +284,7 @@ class Retention implements LoggerAwareInterface
                 }
             }
 
-            if ($this->keepDaily && $day > 0) {
+            if ($this->keepDaily) {
                 $keepCount = count($dailyList);
                 if ($this->keepDaily > $keepCount) {
                     if (!isset($dailyList[$dayIndex])) {
@@ -298,7 +294,7 @@ class Retention implements LoggerAwareInterface
                 }
             }
 
-            if ($this->keepWeekly && $week > 0) {
+            if ($this->keepWeekly) {
                 $keepCount = count($weeklyList);
                 if ($this->keepWeekly > $keepCount) {
                     if (!isset($weeklyList[$weekIndex])) {
@@ -308,7 +304,7 @@ class Retention implements LoggerAwareInterface
                 }
             }
 
-            if ($this->keepMonthly && $month > 0) {
+            if ($this->keepMonthly) {
                 $keepCount = count($monthlyList);
                 if ($this->keepMonthly > $keepCount) {
                     if (!isset($monthlyList[$monthIndex])) {
@@ -318,7 +314,7 @@ class Retention implements LoggerAwareInterface
                 }
             }
 
-            if ($this->keepYearly && $year > 0) {
+            if ($this->keepYearly) {
                 $keepCount = count($yearlyList);
                 if ($this->keepYearly > $keepCount) {
                     if (!isset($yearlyList[$yearIndex])) {
@@ -376,12 +372,14 @@ class Retention implements LoggerAwareInterface
         }
 
         if (empty($keepList)) {
-            // always keep at least 1
+            // always keep at least 1 (safety net; note $files may be an
+            // associative array of groups when a groupHandler is used)
             if (count($files) > 0) {
-                if (!is_array($files[0])) {
-                    $files[0] = [$files[0]];
+                $first = $files[array_key_first($files)];
+                if (!is_array($first)) {
+                    $first = [$first];
                 }
-                foreach ($files[0] as $finfo) {
+                foreach ($first as $finfo) {
                     $keepList[] = [
                         'fileInfo' => $finfo,
                         'reasons' => ['last']
@@ -453,7 +451,7 @@ class Retention implements LoggerAwareInterface
 
         // sort files by descending order (from newest to oldest)
         usort($files, function (FileInfo $a, FileInfo $b) {
-            return $b->timestamp > $a->timestamp ? 1 : -1;
+            return $b->timestamp <=> $a->timestamp;
         });
 
         return $files;
@@ -520,38 +518,32 @@ class Retention implements LoggerAwareInterface
                 if ($scheme === 'file') {
                     // a very basic safeguard against deleting unix root/system folders by mistake
                     // most of the time backup dir will be at least /path/to/foo
-                    $realPathToDelete = realpath($pathToDelete);
-                    if (substr_count($realPathToDelete, '/') < 3) {
-                        // skip if scheme is different (e.g. s3://)
-                        if (str_starts_with($realPathToDelete, '/')) {
-                            throw new RetentionException("Pruning is not allowed in '{$pathToDelete}', because it is marked as risky. The directory depth must be bigger than 2.");
-                        }
+                    // realpath() returns false when the path does not exist; fall back to the
+                    // raw path so the safeguard can never be silently bypassed.
+                    $realPathToDelete = realpath($pathToDelete) ?: $pathToDelete;
+                    if (str_starts_with($realPathToDelete, '/') && substr_count($realPathToDelete, '/') < 3) {
+                        throw new RetentionException("Pruning is not allowed in '{$pathToDelete}', because it is marked as risky. The directory depth must be bigger than 2.");
                     }
                 }
 
                 if ($fileInfo->isDirectory) {
-                    $directory = new RecursiveDirectoryIterator($pathToDelete);
-                    $iterator = new RecursiveIteratorIterator($directory);
-                    $dirsToDelete = [];
+                    // CHILD_FIRST so that nested files/directories are removed before their
+                    // parents. Symlinks are never followed (PHP does not recurse into them by
+                    // default); a symlinked entry is removed with unlink(), which drops the
+                    // link itself and never touches the target outside the tree.
+                    $directory = new RecursiveDirectoryIterator($pathToDelete, FilesystemIterator::SKIP_DOTS);
+                    $iterator = new RecursiveIteratorIterator($directory, RecursiveIteratorIterator::CHILD_FIRST);
                     foreach ($iterator as $info) {
                         /** @var SplFileInfo $info */
-                        if (in_array($info->getFilename(), ['.', '..'])) {
-                            continue;
-                        }
-
-                        $pathToDelete = $info->getPathName();
-                        if (!$info->isDir()) {
-                            unlink($pathToDelete);
+                        $childPath = $info->getPathName();
+                        if ($info->isLink() || !$info->isDir()) {
+                            unlink($childPath);
                         }
                         else {
-                            $dirsToDelete[] = $info->getPathName();
+                            rmdir($childPath);
                         }
                     }
-                    foreach (array_reverse($dirsToDelete) as $pathToDelete) {
-                        rmdir($pathToDelete);
-                    }
 
-                    $pathToDelete = $fileInfo->path;
                     $rs = rmdir($pathToDelete);
                 }
                 else {

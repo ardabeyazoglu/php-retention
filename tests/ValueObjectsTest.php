@@ -36,6 +36,11 @@ class ValueObjectsTest extends TestCase
             'week' => 1,
             'day' => 7,
             'hour' => 13,
+            'hourIndex' => '2024010713',
+            'dayIndex' => '20240107',
+            'weekIndex' => '202401',
+            'monthIndex' => '202401',
+            'yearIndex' => '2024',
             'path' => $path,
             'isDirectory' => true,
         ], $fileInfo->jsonSerialize());
